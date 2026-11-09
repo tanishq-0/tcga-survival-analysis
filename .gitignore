@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# R
+.Rhistory
+.RData
+.Rproj.user/
+
+# Raw GDC metadata written by R/fetch_metadata.py (contains case identifiers)
+R/data/

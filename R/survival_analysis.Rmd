@@ -1,0 +1,325 @@
+---
+title: "Survival and Regression Analysis of TCGA Cohort Metadata"
+author: "Tani Peddagammalla"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.width = 8, fig.height = 5)
+```
+
+## Background
+
+This analysis uses patient metadata I retrieved from the NIH/NCI Genomic Data
+Commons REST API during my MSc research project. The original project used the
+imaging and report data; this analysis uses the clinical fields that came with
+it, which include vital status, time to death and time to last follow-up across
+32 TCGA project cohorts.
+
+The aim is to model overall survival and to check whether the relationships
+behave the way established oncology prognostic factors would predict. I am
+treating the data as observational, because it is: these are not trial arms and
+there is no randomised comparison here.
+
+```{r libraries}
+library(readr)
+library(dplyr)
+library(stringr)
+library(ggplot2)
+library(survival)
+library(survminer)
+library(broom)
+
+set.seed(42)
+```
+
+```{r paths}
+# Created by fetch_metadata.py from the GDC API (see README.md).
+metadata_path <- "data/metadata.csv"
+```
+
+## Loading and cleaning
+
+GDC uses several different tokens for missing values, so they are all declared
+up front rather than cleaned up later.
+
+```{r load}
+raw <- read_csv(
+  metadata_path,
+  na = c("", "NA", "'--", "--", "not reported", "Not Reported",
+         "unknown", "Unknown", "Not Allowed To Collect")
+)
+
+nrow(raw)
+n_distinct(raw$case_id)
+```
+
+The dataset is indexed by slide, and a patient can in principle contribute more
+than one slide. Survival is a patient-level question, so analysing at slide
+level would silently weight patients by how many slides they happen to have. I
+checked rather than assumed: in this extract the two counts are equal, so the
+deduplication below is a no-op. I have left it in because the file is keyed by
+slide and the one-to-one relationship is a property of this particular extract
+rather than something the schema guarantees.
+
+```{r dedupe}
+cases <- raw %>%
+  arrange(case_id, slide_id) %>%
+  distinct(case_id, .keep_all = TRUE)
+
+nrow(cases)
+```
+
+## Constructing the survival object
+
+Follow-up time comes from two different columns depending on whether the patient
+died during follow-up. Patients still alive at last contact are right-censored.
+
+```{r survprep}
+dat <- cases %>%
+  mutate(
+    event = case_when(
+      vital_status == "Dead"  ~ 1L,
+      vital_status == "Alive" ~ 0L,
+      TRUE ~ NA_integer_
+    ),
+    time_days = if_else(event == 1L,
+                        as.numeric(days_to_death),
+                        as.numeric(days_to_last_follow_up)),
+    time_months = time_days / 30.44,
+
+    # AJCC stage arrives as "Stage IIIA", "Stage IV" and similar.
+    # Order matters here: case_when short-circuits, so IV is tested
+    # before III, which is tested before II, before I.
+    stage = case_when(
+      str_detect(ajcc_pathologic_stage, "IV")  ~ "IV",
+      str_detect(ajcc_pathologic_stage, "III") ~ "III",
+      str_detect(ajcc_pathologic_stage, "II")  ~ "II",
+      str_detect(ajcc_pathologic_stage, "I")   ~ "I",
+      TRUE ~ NA_character_
+    ),
+    stage   = factor(stage, levels = c("I", "II", "III", "IV")),
+    sex     = factor(gender),
+    age     = as.numeric(age_at_index),
+    cohort  = factor(project_id)
+  ) %>%
+  filter(!is.na(event), !is.na(time_days), time_days > 0)
+
+nrow(dat)
+table(dat$event)
+```
+
+Cases with non-positive follow-up time are dropped. A recorded survival time of
+zero or less is a data quality artefact rather than an instantaneous death, and
+`Surv()` will not accept it.
+
+```{r cohortsummary}
+dat %>%
+  group_by(cohort) %>%
+  summarise(
+    n       = n(),
+    deaths  = sum(event),
+    staged  = sum(!is.na(stage)),
+    median_followup_months = round(median(time_months), 1),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(n))
+```
+
+### Staging is missing by design, not at random
+
+The `staged` column is worth pausing on. Roughly a third of the analysis set has
+no AJCC stage, and the missingness is not spread evenly: entire cohorts have
+none at all. That is not a data quality problem, it is a clinical one. AJCC
+staging does not apply to several of these tumour types. Brain tumours (LGG,
+GBM) are graded by WHO criteria rather than staged by TNM; gynaecological
+cancers such as UCEC, OV and CESC are conventionally staged by FIGO; prostate
+cancer in this release carries its own staging fields.
+
+This matters because every model below that includes stage silently excludes
+those cohorts. That drops the sample from 6,864 patients to 4,346 and removes
+whole tumour types from the analysis rather than a random subset of patients.
+Reporting the stage-adjusted hazard ratios without saying so would overstate
+what the model covers, so the restricted sample is stated alongside each result.
+
+## Kaplan-Meier estimates
+
+```{r km-overall}
+fit_overall <- survfit(Surv(time_months, event) ~ 1, data = dat)
+fit_overall
+```
+
+Stratifying by AJCC stage. If the data behave sensibly, the curves should
+separate in stage order, with Stage IV the worst.
+
+```{r km-stage, fig.height=7}
+stage_dat <- dat %>% filter(!is.na(stage))
+
+fit_stage <- survfit(Surv(time_months, event) ~ stage, data = stage_dat)
+
+ggsurvplot(
+  fit_stage,
+  data        = stage_dat,
+  pval        = TRUE,
+  conf.int    = TRUE,
+  risk.table  = TRUE,
+  xlab        = "Months since diagnosis",
+  ylab        = "Overall survival probability",
+  legend.title = "AJCC stage",
+  palette     = "Dark2"
+)
+```
+
+Median survival with confidence intervals, read off the same fit:
+
+```{r km-medians}
+round(
+  summary(fit_stage)$table[, c("records", "events", "median", "0.95LCL", "0.95UCL")],
+  1
+)
+```
+
+The ordering is monotonic in stage, and the gap between Stage III and Stage IV
+is far larger than any other adjacent pair, which is what the hazard ratios
+below also show.
+
+The upper confidence limit is `NA` for Stages I, II and III. That is not a
+failure of the computation: the survival curve for those groups never drops far
+enough below 0.5 within the observed follow-up for an upper bound on the median
+to be estimated. The median itself is identified, but how much longer it could
+plausibly be is not, and quoting the point estimate without that caveat would
+imply more precision than the data support.
+
+```{r logrank}
+survdiff(Surv(time_months, event) ~ stage, data = stage_dat)
+```
+
+The log-rank test asks whether the survival distributions differ across stage
+groups. It tells us the curves are not the same; it does not tell us by how
+much, or in which direction, which is what the Cox model below is for.
+
+## Cox proportional hazards model
+
+```{r cox}
+cox_dat <- stage_dat %>%
+  filter(!is.na(age), !is.na(sex)) %>%
+  mutate(cohort = droplevels(cohort))
+
+cox_fit <- coxph(
+  Surv(time_months, event) ~ age + sex + stage + strata(cohort),
+  data = cox_dat
+)
+
+summary(cox_fit)
+```
+
+I stratify by cohort rather than adjusting for it. Different tumour types have
+very different baseline hazards, and stratification lets each cohort keep its own
+baseline while still estimating a shared effect for age, sex and stage. Treating
+cohort as an ordinary covariate would force a single baseline hazard onto all 22
+cohorts in the model, which is not a defensible assumption.
+
+```{r cox-tidy}
+tidy(cox_fit, exponentiate = TRUE, conf.int = TRUE) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 3)))
+```
+
+Coefficients are exponentiated, so they read as hazard ratios. A hazard ratio
+above 1 means a higher instantaneous risk of death relative to the reference
+level, which is Stage I for stage and the first factor level for sex.
+
+### Checking the proportional hazards assumption
+
+The Cox model assumes hazard ratios are constant over time. That assumption is
+testable and is worth testing rather than asserting.
+
+```{r phtest}
+ph_test <- cox.zph(cox_fit)
+ph_test
+```
+
+```{r phplot, fig.height=6}
+plot(ph_test)
+```
+
+A small p-value for a term means its effect varies with time, in which case the
+single hazard ratio reported above is an average over the follow-up period and
+should not be quoted as if it were constant. The global test covers the model as
+a whole.
+
+## Logistic regression
+
+A separate question, and a binary rather than time-to-event one: can we predict
+whether a patient presented at an advanced stage from demographic information
+alone?
+
+```{r logistic}
+log_dat <- cox_dat %>%
+  mutate(advanced = as.integer(stage %in% c("III", "IV")))
+
+logit_fit <- glm(advanced ~ age + sex, data = log_dat, family = binomial)
+
+tidy(logit_fit, exponentiate = TRUE, conf.int = TRUE) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 3)))
+```
+
+```{r logistic-fitcheck}
+log_dat$pred <- predict(logit_fit, type = "response")
+
+# Calibration: observed rate within deciles of predicted risk.
+log_dat %>%
+  mutate(decile = ntile(pred, 10)) %>%
+  group_by(decile) %>%
+  summarise(
+    mean_predicted = round(mean(pred), 3),
+    observed_rate  = round(mean(advanced), 3),
+    n = n(),
+    .groups = "drop"
+  )
+```
+
+I check calibration rather than only discrimination because a model can rank
+patients well and still produce probabilities that are systematically wrong. If
+the mean predicted risk in each decile does not track the observed rate, the
+model is miscalibrated even if it separates cases adequately.
+
+Here the result is negative, and worth reporting as such. Both coefficients
+reach significance, but predicted risk spans only about 0.25 to 0.42 across the
+whole cohort, and the observed rate does not increase monotonically across
+deciles: the top decile sits below the eighth. Age and sex carry a real but very
+weak signal for stage at presentation, and a model built on them alone is not
+usable for anything. That is a sensible clinical finding rather than a
+disappointing one, since stage at diagnosis depends on tumour biology,
+screening access and time to presentation rather than on demographics. It is
+also a reminder that statistical significance and practical usefulness are
+different questions: with roughly four thousand patients, a trivial effect will
+clear p < 0.001 comfortably.
+
+## Limitations
+
+Worth stating explicitly, since these constrain what the results above can
+support:
+
+- This is observational data from a tissue repository, not a clinical trial.
+  There is no randomisation and no controlled comparison, so none of the
+  estimates here are causal.
+- Treatment information in these fields is sparse, so the models are
+  unadjusted for therapy, which is a substantial confounder for survival.
+- Follow-up duration varies considerably between cohorts, and cohorts with
+  short follow-up contribute few events.
+- Stage was collapsed from the AJCC sub-stages, which discards information
+  within each stage group.
+- Deduplication to one row per case keeps the first slide per patient. The
+  clinical fields are patient-level so this does not bias the clinical data,
+  but it is an arbitrary choice worth recording.
+
+## Session information
+
+```{r session}
+sessionInfo()
+```
